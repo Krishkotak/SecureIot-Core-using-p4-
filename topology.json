@@ -1,0 +1,65 @@
+{
+  "hosts": {
+    "h_sensor": {
+      "ip": "10.0.1.1/24",
+      "mac": "08:00:00:00:01:11",
+      "commands": [
+        "route add default gw 10.0.1.10 dev eth0",
+        "arp -i eth0 -s 10.0.1.10 08:00:00:00:01:00"
+      ]
+    },
+    "h_actuator": {
+      "ip": "10.0.2.2/24",
+      "mac": "08:00:00:00:02:22",
+      "commands": [
+        "route add default gw 10.0.2.20 dev eth0",
+        "arp -i eth0 -s 10.0.2.20 08:00:00:00:02:00"
+      ]
+    },
+    "h_service": {
+      "ip": "10.0.3.3/24",
+      "mac": "08:00:00:00:03:33",
+      "commands": [
+        "route add default gw 10.0.3.30 dev eth0",
+        "arp -i eth0 -s 10.0.3.30 08:00:00:00:03:00"
+      ]
+    }
+  },
+
+  "switches": {
+    "s1": {
+      "runtime_json": "build/token_auth.json",
+      "grpc_port": 50051,
+      "device_id": 0
+    },
+    "s2": {
+      "runtime_json": "build/token_auth.json",
+      "grpc_port": 50052,
+      "device_id": 1
+    },
+    "s3": {
+      "runtime_json": "build/token_auth.json",
+      "grpc_port": 50053,
+      "device_id": 2
+    }
+  },
+
+  "links": [
+    ["h_sensor", "s1-p1"],
+    ["s1-p2", "s2-p2"],
+    ["s1-p3", "s3-p2"],
+    ["s3-p3", "s2-p3"],
+    ["h_actuator", "s2-p1"],
+    ["h_service", "s3-p1"]
+  ],
+
+  "controller": {
+    "cmd": [
+      "python3",
+      "controller/token_controller.py",
+      "--p4info", "build/token_auth.p4.p4info.txtpb",
+      "--bmv2-json", "build/token_auth.json"
+    ]
+  }
+}
+ 

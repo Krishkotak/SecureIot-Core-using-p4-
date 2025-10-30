@@ -1,0 +1,14 @@
+
+
+main()
+ ├── load_topology()
+ ├── connect_switches()
+ ├── register_packetin_handler()
+ │      └── on_packetin()
+ │             ├── parse_packetin()
+ │             ├── authenticate_device()
+ │             ├── generate_token()
+ │             ├── compute_path()
+ │             ├── install_token_rules()
+ │             └── send_packetout()
+ └── event_loop()
