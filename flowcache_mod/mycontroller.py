@@ -32,13 +32,14 @@ global_data = {}
 global_data['CPU_PORT'] = 510
 global_data['CPU_PORT_CLONE_SESSION_ID'] = 57
 global_data['NUM_PORTS'] = 3
-global_data['index'] = 0
+# 'index' is deprecated, will be determined per-packet
+# global_data['index'] = 0 
 global_data["10.0.1.1"] = "08:00:00:00:01:11"
 global_data["10.0.2.2"] = "08:00:00:00:02:22"
 global_data["10.0.3.3"] = "08:00:00:00:03:33"
 
 # NEW: Topology data structures
-global_data['switches'] = {} # s1, s2, s3 objects
+global_data['switches'] = {} # s1, s2, s3, s4, s5 objects
 global_data['topology'] = {} # Loaded topology.json
 global_data['host_info'] = {} # IP -> {name, mac, switch, port}
 global_data['link_info'] = {} # s1 -> {s2: port, h1: port}
@@ -47,8 +48,6 @@ global_data['link_info'] = {} # s1 -> {s2: port, h1: port}
 ## The notification database keeps track of the received idle notifications
 notif_db = {}
 
-# The lookup table is NO LONGER NEEDED, it will be replaced by get_path()
-# lookup_table = { ... }
 
 def load_topology(topo_file_path):
     """Loads and parses the topology.json file."""
@@ -69,45 +68,47 @@ def load_topology(topo_file_path):
     # Parse links to find host locations and switch-switch ports
     for link in topo['links']:
         node1, node2 = link[0], link[1]
+        
+        # Determine if port is specified, e.g., "s1-p1"
+        def parse_node(node):
+            if '-p' in node:
+                parts = node.split('-p')
+                return parts[0], int(parts[1])
+            return node, None # Host or switch name without port
 
-        if node1.startswith('h') and node2.startswith('s'):
-            # Host-to-switch link
-            h_name = node1
-            sw_name, sw_port = node2.split('-p')
-            sw_port = int(sw_port)
-            
+        node1_name, node1_port = parse_node(node1)
+        node2_name, node2_port = parse_node(node2)
+
+        if node1_name.startswith('h'):
+            h_name = node1_name
+            sw_name = node2_name
+            sw_port = node2_port
             # Find the IP for this host
             for ip, info in host_info.items():
                 if info['name'] == h_name:
                     info['switch'] = sw_name
                     info['port'] = sw_port
                     break
-            
             link_info.setdefault(sw_name, {})[h_name] = sw_port
-            link_info.setdefault(h_name, {})[sw_name] = 0 # Host port doesn't matter here
+            link_info.setdefault(h_name, {})[sw_name] = 0 # Host port doesn't matter
             
-        elif node1.startswith('s') and node2.startswith('h'):
-            # Switch-to-host link
-            sw_name, sw_port = node1.split('-p')
-            sw_port = int(sw_port)
-            h_name = node2
-
+        elif node2_name.startswith('h'):
+            h_name = node2_name
+            sw_name = node1_name
+            sw_port = node1_port
             # Find the IP for this host
             for ip, info in host_info.items():
                 if info['name'] == h_name:
                     info['switch'] = sw_name
                     info['port'] = sw_port
                     break
-            
             link_info.setdefault(sw_name, {})[h_name] = sw_port
             link_info.setdefault(h_name, {})[sw_name] = 0
             
-        elif node1.startswith('s') and node2.startswith('s'):
+        elif node1_name.startswith('s') and node2_name.startswith('s'):
             # Switch-to-switch link
-            sw1_name, sw1_port = node1.split('-p')
-            sw1_port = int(sw1_port)
-            sw2_name, sw2_port = node2.split('-p')
-            sw2_port = int(sw2_port)
+            sw1_name, sw1_port = node1_name, node1_port
+            sw2_name, sw2_port = node2_name, node2_port
             
             link_info.setdefault(sw1_name, {})[sw2_name] = sw1_port
             link_info.setdefault(sw2_name, {})[sw1_name] = sw2_port
@@ -122,7 +123,7 @@ def load_topology(topo_file_path):
 def get_path(src_ip, dst_ip):
     """
     Performs a BFS on the topology to find a simple path.
-    Returns: A list of switch names (e.g., ['s1', 's3', 's2']) or None
+    Returns: A list of switch names (e.g., ['s1', 's4', 's2']) or None
     """
     graph = global_data['link_info']
     host_info = global_data['host_info']
@@ -169,9 +170,20 @@ def intToIpv4(n):
                             n & 0xff)
 
 def flowCacheEntryToDebugStr(table_entry, include_action=False):
-    src_ip = intToIpv4(int.from_bytes(table_entry.match[1].exact.value, byteorder='big'))
-    dst_ip = intToIpv4(int.from_bytes(table_entry.match[2].exact.value, byteorder='big'))
-    proto = int.from_bytes(table_entry.match[0].exact.value, byteorder='big')
+    # This function is now safer as it iterates fields
+    src_ip, dst_ip, proto = "","",""
+    p4info_helper = global_data['p4info_helper']
+    table_name = "MyIngress.flow_cache"
+    
+    for match_field in table_entry.match:
+        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
+        if field_name == "hdr.ipv4.protocol":
+            proto = int.from_bytes(match_field.exact.value, byteorder='big')
+        elif field_name == "hdr.ipv4.srcAddr":
+            src_ip = intToIpv4(int(ipaddress.IPv4Address(match_field.exact.value)))
+        elif field_name == "hdr.ipv4.dstAddr":
+            dst_ip = intToIpv4(int(ipaddress.IPv4Address(match_field.exact.value)))
+            
     return (f"(SA={src_ip}, DA={dst_ip}, proto={proto})")
 
 def decodePacketInMetadata(pktin_info, packet):
@@ -260,14 +272,31 @@ def addFlowRule(ingress_sw, src_ip_addr, dst_ip_addr, protocol, port, new_dscp, 
     ingress_sw.WriteTableEntry(table_entry)
 
 def createFlowRule(notif):
-    """Creates a table_entry object from an idle timeout notification."""
-    table_entry = global_data['p4info_helper'].buildTableEntry(
-        table_name="MyIngress.flow_cache",
-        match_fields={
-            "hdr.ipv4.protocol": int.from_bytes(notif["idle"].table_entry[0].match[0].exact.value,byteorder='big'),
-            "hdr.ipv4.srcAddr": int(ipaddress.IPv4Address(notif["idle"].table_entry[0].match[1].exact.value)),
-            "hdr.ipv4.dstAddr": int(ipaddress.IPv4Address(notif["idle"].table_entry[0].match[2].exact.value))
-        },
+    """
+    Creates a table_entry object from an idle timeout notification.
+    This version is more robust and uses P4Info.
+    """
+    p4info_helper = global_data['p4info_helper']
+    table_name = "MyIngress.flow_cache"
+    
+    match_fields_from_notif = {}
+    for match_field in notif["idle"].table_entry[0].match:
+        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
+        
+        # Re-build the Python value from the protobuf bytes
+        if field_name == "hdr.ipv4.protocol":
+            value = int.from_bytes(match_field.exact.value, byteorder='big')
+        elif field_name == "hdr.ipv4.srcAddr" or field_name == "hdr.ipv4.dstAddr":
+            value = int(ipaddress.IPv4Address(match_field.exact.value))
+        else:
+            # Fallback for other match types, though not used here
+            value = p4info_helper.get_match_field_value(match_field)
+            
+        match_fields_from_notif[field_name] = value
+
+    table_entry = p4info_helper.buildTableEntry(
+        table_name=table_name,
+        match_fields=match_fields_from_notif
     )
     return table_entry
 
@@ -281,11 +310,18 @@ def addNotification(sw_name, flow_rule):
     notif_db[sw_name].append(notification)
 
 def checkFlowRule(sw_name, flow_rule):
+    """
+    Checks if a flow rule with the same match fields is already in the notification DB.
+    FIX: Compares the .match field directly instead of the whole object.
+    """
     if sw_name not in notif_db:
         return False
+
     for notif in notif_db[sw_name]:
-        if notif["flow_rule"] == flow_rule:
+        # Compare the match fields directly
+        if notif["flow_rule"].match == flow_rule.match:
             return True
+        
     return False
 
 def isExpired(timestamp, timeout):
@@ -335,17 +371,18 @@ def printCounter(p4info_helper, sw, counter_name, index):
            time.sleep(2)
 
 def processPacket(message):
+        """Processes a PacketIn message."""
         payload = message["packet-in"].payload
         packet = message["packet-in"]
         ingress_sw_name = message["sw"].name
         print(f"Received PacketIn message of length {len(payload)} bytes from switch {ingress_sw_name}")
         
         if len(payload) == 0:
-            return
+            return None # Return None if no payload
 
         pkt = Ether(payload)
         if not pkt.haslayer(IP):
-            return
+            return None # Return None if not IP
 
         ip_proto = pkt[IP].proto
         ip_sa_str = pkt[IP].src
@@ -353,28 +390,29 @@ def processPacket(message):
         ip_da_str = pkt[IP].dst
         dst_ip_addr = ipv4ToInt(ip_da_str)
         
+        # Calculate the counter index based on the P4 logic
+        counter_index = int(pkt[IP].dst.split('.')[3])
+        
         pktinfo = decodePacketInMetadata(global_data['cpm_packetin_id2data'], packet)
 
         if pktinfo['metadata']['punt_reason'] != global_data['punt_reason_name2int']['FLOW_UNKNOWN']:
             print(f"Ignoring PacketIn from {ingress_sw_name} with reason {pktinfo['metadata']['punt_reason']}")
-            return
-        
+            return counter_index # Return the index for logging
+
         print(f"Processing FLOW_UNKNOWN PacketIn from {ingress_sw_name} for flow: {ip_sa_str} -> {ip_da_str}")
 
-        # --- NEW PROACTIVE PATH INSTALLATION LOGIC ---
-        
         # 1. Calculate the full path of switches
         path = get_path(ip_sa_str, ip_da_str)
         if not path:
             print(f"Could not find path for {ip_sa_str} -> {ip_da_str}. Dropping.")
-            return
+            return counter_index # Return the index for logging
 
         # 2. Find where in the path this PacketIn came from
         try:
             ingress_sw_index = path.index(ingress_sw_name)
         except ValueError:
             print(f"Error: Switch {ingress_sw_name} not on path {path} for flow. Dropping.")
-            return
+            return counter_index # Return the index for logging
 
         # 3. Get final destination MAC (for L2 rewrite on the last hop)
         final_dest_mac = global_data['host_info'][ip_da_str]['mac']
@@ -396,21 +434,18 @@ def processPacket(message):
                 # This is a transit switch. Forward to the next switch.
                 next_switch_name = path[i+1]
                 output_port = global_data['link_info'][current_switch_name][next_switch_name]
-                # The P4 program's cached_action needs the *final* dest MAC for L2 rewrite
                 dest_mac = final_dest_mac 
                 print(f"Installing Transit rule on {current_switch_name}: flow -> port {output_port} (to switch {next_switch_name})")
 
-            # Store the first output port for the PacketOut message
             if i == ingress_sw_index:
                 packet_out_port = output_port
 
-            # Install the rule
             addFlowRule(current_switch_obj,
                         src_ip_addr,
                         dst_ip_addr,
                         ip_proto,
                         output_port,
-                        new_dscp=5, # Example DSCP
+                        new_dscp=5,
                         decrement_ttl_bool=True,
                         dst_eth_addr=dest_mac)
 
@@ -424,25 +459,27 @@ def processPacket(message):
         else:
             print("Error: Could not determine PacketOut port.")
 
+        return counter_index
+
 async def processNotif(notif_queue):
+        """Main notification processing loop."""
         while True:
             notif = await notif_queue.get()
-            debug_notif = False
-            if debug_notif:
-                print(notif)
-                pprint.pprint(notif_db)
             
             if notif["type"] == "packet-in":
+                counter_index = None # Default
                 try:
-                    processPacket(notif)
+                    counter_index = processPacket(notif)
                 except Exception as e:
                     print(f"Error processing packet: {e}")
                     traceback.print_exc()
                 
-                # We can't guarantee 'index' is set if processPacket fails
-                if global_data['index'] is not None:
-                    printCounter(global_data ['p4info_helper'], notif["sw"], 'MyIngress.ingressPktOutCounter', global_data ['index'])
-                    printCounter(global_data ['p4info_helper'], notif["sw"], 'MyEgress.egressPktInCounter', global_data ['index'])
+                if counter_index is not None:
+                    # Apply the P4 logic: index is mod 4
+                    read_index = counter_index % 4
+                    print(f"--- Reading counters for index {read_index} on {notif['sw'].name} ---")
+                    printCounter(global_data['p4info_helper'], notif["sw"], 'MyIngress.ingressPktOutCounter', read_index)
+                    printCounter(global_data['p4info_helper'], notif["sw"], 'MyEgress.egressPktInCounter', read_index)
                 
             elif notif["type"] == "idle-notif":
                 sw_name = notif["sw"].name
@@ -456,13 +493,22 @@ async def processNotif(notif_queue):
                 if not checkFlowRule(sw_name, table_entry):
                     addNotification(sw_name, table_entry)
                     print(f"Received IdleTimeout for flow on {sw_name}. Deleting rule.")
-                    deleteFlowRule(notif["sw"], table_entry)
+                    
+                    # --- FIX: Add try/except block around the gRPC call ---
+                    try:
+                        deleteFlowRule(notif["sw"], table_entry)
+                    except grpc.RpcError as e:
+                        print(f"Error deleting rule on {sw_name}:")
+                        printGrpcError(e)
+                    # --- END FIX ---
+                        
                 else:
                     print(f"Received duplicate idle timeout notification for switch={sw_name}, ignoring.")
             
             notif_queue.task_done()
 
 async def packetInHandler(notif_queue, sw):
+    """Listens for PacketIn messages from a switch."""
     while True:
         try:
             packet_in = await asyncio.to_thread(sw.PacketIn)
@@ -480,6 +526,7 @@ async def packetInHandler(notif_queue, sw):
             await asyncio.sleep(2)
 
 async def idleTimeHandler(notif_queue, sw):
+    """Listens for IdleTimeout notifications from a switch."""
     while True:
         try:
             idle_notif = await asyncio.to_thread(sw.IdleTimeoutNotification)
@@ -512,49 +559,47 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
     global_data['p4info_helper'] = p4runtime_lib.helper.P4InfoHelper(p4info_file_path)
     p4info_helper = global_data['p4info_helper']
 
-    # NEW: Load topology
+    # Load topology
     try:
         load_topology(topo_file_path)
     except Exception as e:
         print(f"Error loading topology file: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
     try:
-        # Create switch connection objects
-        s1 = p4runtime_lib.bmv2.Bmv2SwitchConnection(
-            name='s1',
-            address='127.0.0.1:50051',
-            device_id=0,
-            proto_dump_file='logs/s1-p4runtime-requests.txt')
-        s2 = p4runtime_lib.bmv2.Bmv2SwitchConnection(
-            name='s2',
-            address='127.0.0.1:50052',
-            device_id=1,
-            proto_dump_file='logs/s2-p4runtime-requests.txt')
-        s3 = p4runtime_lib.bmv2.Bmv2SwitchConnection(
-            name='s3',
-            address='127.0.0.1:50053',
-            device_id=2,
-            proto_dump_file='logs/s3-p4runtime-requests.txt')
+        # --- DYNAMIC SWITCH CONNECTION ---
+        global_data['switches'] = {}
+        switch_names = sorted(global_data['topology']['switches'].keys())
         
-        # NEW: Store switch objects in global_data for access in processPacket
-        global_data['switches'] = {'s1': s1, 's2': s2, 's3': s3}
+        all_switches = []
+        device_id_counter = 0
+        grpc_port_base = 50051 # Standard base port
 
-        # Send master arbitration update
-        s1.MasterArbitrationUpdate()
-        s2.MasterArbitrationUpdate()
-        s3.MasterArbitrationUpdate()
-
-        # Install the P4 program
-        s1.SetForwardingPipelineConfig(p4info=p4info_helper.p4info,
-                                       bmv2_json_file_path=bmv2_file_path)
-        print("Installed P4 Program on s1")
-        s2.SetForwardingPipelineConfig(p4info=p4info_helper.p4info,
-                                       bmv2_json_file_path=bmv2_file_path)
-        print("Installed P4 Program on s2")
-        s3.SetForwardingPipelineConfig(p4info=p4info_helper.p4info,
-                                       bmv2_json_file_path=bmv2_file_path)
-        print("Installed P4 Program on s3")
+        for sw_name in switch_names:
+            device_id = device_id_counter
+            grpc_port = grpc_port_base + device_id_counter
+            
+            sw = p4runtime_lib.bmv2.Bmv2SwitchConnection(
+                name=sw_name,
+                address=f'127.0.0.1:{grpc_port}',
+                device_id=device_id,
+                proto_dump_file=f'logs/{sw_name}-p4runtime-requests.txt'
+            )
+            global_data['switches'][sw_name] = sw
+            all_switches.append(sw)
+            device_id_counter += 1
+        
+        # Master arbitration and pipeline config for all switches
+        for sw in all_switches:
+            sw.MasterArbitrationUpdate()
+            print(f"Established mastership for {sw.name}")
+            
+        for sw in all_switches:
+            sw.SetForwardingPipelineConfig(p4info=p4info_helper.p4info,
+                                           bmv2_json_file_path=bmv2_file_path)
+            print(f"Installed P4 Program on {sw.name}")
+        # --- END DYNAMIC SWITCH CONNECTION ---
 
         # Parse P4Info for metadata IDs
         global_data['p4info_obj_map'] = makeP4infoObjMap(p4info_helper.p4info)
@@ -568,24 +613,17 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
 
         # Configure clone session for Packet-In
         replicas = [{ "egress_port": global_data['CPU_PORT'], "instance": 1 }]
-        writeCloneSession(s1, global_data['CPU_PORT_CLONE_SESSION_ID'], replicas)
-        writeCloneSession(s2, global_data['CPU_PORT_CLONE_SESSION_ID'], replicas)
-        writeCloneSession(s3, global_data['CPU_PORT_CLONE_SESSION_ID'], replicas)
+        for sw in all_switches:
+            writeCloneSession(sw, global_data['CPU_PORT_CLONE_SESSION_ID'], replicas)
         print("Configured clone sessions for Packet-In")
 
         # Start listening for notifications
         notif_queue = asyncio.Queue()
-
-        tasks = [
-            asyncio.create_task(packetInHandler(notif_queue, s1)),
-            asyncio.create_task(packetInHandler(notif_queue, s2)),
-            asyncio.create_task(packetInHandler(notif_queue, s3)),
-            asyncio.create_task(idleTimeHandler(notif_queue, s1)),
-            asyncio.create_task(idleTimeHandler(notif_queue, s2)),
-            asyncio.create_task(idleTimeHandler(notif_queue, s3)),
-            asyncio.create_task(processNotif(notif_queue))
-        ]
-
+        tasks = [asyncio.create_task(processNotif(notif_queue))]
+        for sw in all_switches:
+            tasks.append(asyncio.create_task(packetInHandler(notif_queue, sw)))
+            tasks.append(asyncio.create_task(idleTimeHandler(notif_queue, sw)))
+        
         await asyncio.gather(*tasks)
 
     except KeyboardInterrupt:
@@ -594,6 +632,7 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
         print(f"gRPC error occurred: {e}")
         print(f"Status code: {e.code()}")
         print(f"Details: {e.details()}")
+        printGrpcError(e)
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         traceback.print_exc()
@@ -608,16 +647,24 @@ if __name__ == '__main__':
     parser.add_argument('--bmv2-json', help='BMv2 JSON file from p4c',
                         type=str, action="store", required=False,
                         default='./build/flowcache.json')
-    # NEW: Add argument for topology file
+    # FIX: Changed this from a positional argument to an optional one.
     parser.add_argument('--topo', help='Topology JSON file',
                         type=str, action="store", required=False,
                         default='topology.json')
     args = parser.parse_args()
 
-    for f in [args.p4info, args.bmv2_json, args.topo]:
+    # Use the provided topology.json file
+    topo_file = args.topo
+    if not os.path.exists(topo_file):
+        print(f"Error: Topology file not found: {topo_file}")
+        parser.print_help()
+        sys.exit(1)
+
+    for f in [args.p4info, args.bmv2_json]:
         if not os.path.exists(f):
             parser.print_help()
             print(f"\nFile not found: {f}\nHave you run 'make'?")
             sys.exit(1)
 
-    asyncio.run(main(args.p4info, args.bmv2_json, args.topo))
+    asyncio.run(main(args.p4info, args.bmv2_json, topo_file))
+
