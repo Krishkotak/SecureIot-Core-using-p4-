@@ -5,13 +5,11 @@ import os
 import sys
 import asyncio
 import traceback
-import time
 import ipaddress
 import pprint
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
 from scapy.all import *
 
 import grpc
@@ -23,7 +21,6 @@ sys.path.append(
 import p4runtime_lib.bmv2
 import p4runtime_lib.helper
 from p4runtime_lib.switch import ShutdownAllSwitchConnections
-import p4runtime_sh.p4runtime as shp4rt
 
 # --- Setup standard Python logging ---
 log = logging.getLogger('P4Controller')
@@ -33,7 +30,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-NSEC_PER_SEC = 1000 * 1000 * 1000
 RETRY_TIMES = 3
 RETRY_SLEEP_SEC = 0.1
 
@@ -45,10 +41,6 @@ global_data['topology'] = {}
 global_data['host_info'] = {}
 global_data['link_info'] = {}
 global_data['path_cache'] = {}
-
-# ### DISABLED IDLE TIMEOUT ###
-# global_data['flow_lock'] = asyncio.Lock()
-# global_data['active_flows'] = {}
 
 
 def load_topology(topo_file_path):
@@ -66,14 +58,16 @@ def load_topology(topo_file_path):
         host_info[ip] = {'name': h_name, 'mac': h_details['mac']}
 
     link_info = {}
+
+    def parse_node(node):
+        """Helper to parse node strings like 's1-p1'"""
+        if '-p' in node:
+            parts = node.split('-p')
+            return parts[0], int(parts[1])
+        return node, None
+
     for link in topo['links']:
         node1, node2 = link[0], link[1]
-
-        def parse_node(node):
-            if '-p' in node:
-                parts = node.split('-p')
-                return parts[0], int(parts[1])
-            return node, None
 
         node1_name, node1_port = parse_node(node1)
         node2_name, node2_port = parse_node(node2)
@@ -86,7 +80,6 @@ def load_topology(topo_file_path):
                     info['port'] = sw_port
                     break
             link_info.setdefault(sw_name, {})[h_name] = sw_port
-            link_info.setdefault(h_name, {})[sw_name] = 0
 
         elif node2_name.startswith('h'):
             h_name, sw_name, sw_port = node2_name, node1_name, node1_port
@@ -96,7 +89,6 @@ def load_topology(topo_file_path):
                     info['port'] = sw_port
                     break
             link_info.setdefault(sw_name, {})[h_name] = sw_port
-            link_info.setdefault(h_name, {})[sw_name] = 0
 
         elif node1_name.startswith('s') and node2_name.startswith('s'):
             sw1_name, sw1_port = node1_name, node1_port
@@ -191,31 +183,6 @@ def flowCacheEntryToDebugStr(table_entry):
     return f"({', '.join(parts)})"
 
 
-def get_flow_key_from_table_entry(table_entry):
-    """
-    Extracts the (src_ip_int, dst_ip_int, proto) tuple from a table entry.
-    """
-    p4info_helper = global_data['p4info_helper']
-    table_name = "MyIngress.flow_cache"
-    
-    src_ip, dst_ip, proto = None, None, None
-    
-    for match_field in table_entry.match:
-        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
-        if field_name == "hdr.ipv4.protocol":
-            proto = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ipv4.srcAddr":
-            src_ip = int(ipaddress.IPv4Address(match_field.exact.value))
-        elif field_name == "hdr.ipv4.dstAddr":
-            dst_ip = int(ipaddress.IPv4Address(match_field.exact.value))
-    
-    if src_ip is None or dst_ip is None or proto is None:
-        log.warning(f"Could not parse full flow key from table entry: {table_entry}")
-        return None
-        
-    return (src_ip, dst_ip, proto)
-
-
 def decodePacketInMetadata(pktin_info, packet):
     pktin_field_to_val = {}
     for md in packet.metadata:
@@ -305,8 +272,6 @@ async def addFlowRule(ingress_sw, src_ip_addr, dst_ip_addr, protocol, port,
             "new_dscp":       new_dscp,
             "dst_eth_addr":   dst_eth_addr
         }
-        # ### DISABLED IDLE TIMEOUT ###
-        # idle_timeout_ns=3 * NSEC_PER_SEC
     )
     
     log.info(f"Installing rule on {ingress_sw.name}: "
@@ -341,64 +306,6 @@ async def write_table_entry(sw, table_entry):
     return False
 
 
-def createFlowRule(notif):
-    """
-    Creates a table_entry object from an idle timeout notification.
-    This version is P4Info-aware and robust.
-    """
-    p4info_helper = global_data['p4info_helper']
-    table_name = "MyIngress.flow_cache"
-    
-    match_fields_from_notif = {}
-    notif_entry = notif["idle"].table_entry[0]
-    
-    for match_field in notif_entry.match:
-        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
-        
-        if field_name == "hdr.ipv4.protocol":
-            value = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ipv4.srcAddr" or field_name == "hdr.ipv4.dstAddr":
-            value = int(ipaddress.IPv4Address(match_field.exact.value))
-        else:
-            value = p4info_helper.get_match_field_value(match_field)
-            
-        match_fields_from_notif[field_name] = value
-
-    table_entry = p4info_helper.buildTableEntry(
-        table_name=table_name,
-        match_fields=match_fields_from_notif
-    )
-    return table_entry
-
-
-async def deleteFlowRule(sw, table_entry):
-    """
-    Deletes a table entry with retry logic.
-    """
-    log.info(f"Deleting flow_cache entry on {sw.name}: "
-             f"{flowCacheEntryToDebugStr(table_entry)}")
-    
-    for i in range(RETRY_TIMES):
-        try:
-            sw.DeleteTableEntry(table_entry)
-            log.debug(f"Successfully deleted entry from {sw.name}")
-            return True
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNKNOWN or e.code() == grpc.StatusCode.NOT_FOUND:
-                log.warning(f"gRPC error deleting from {sw.name} (Attempt {i + 1}/{RETRY_TIMES}): {e.code().name}. Retrying...")
-                await asyncio.sleep(RETRY_SLEEP_SEC)
-            else:
-                log.warning(f"Non-retriable gRPC error deleting from {sw.name} (may be ok):")
-                printGrpcError(e)
-                return False
-        except Exception as e:
-            log.error(f"Unexpected error deleting from {sw.name}: {e}")
-            traceback.print_exc()
-            return False
-    log.error(f"Failed to delete entry from {sw.name} after {RETRY_TIMES} attempts.")
-    return False
-
-
 def packetOutMetadataList(opcode, reserved1, operand0):
     """
     Builds the PacketOut metadata list based on the P4 program's
@@ -427,18 +334,6 @@ def sendPacketOut(sw, payload, metadatas):
     """
     log.debug(f"Sending PacketOut to {sw.name} with {len(payload)} bytes")
     sw.PacketOut(payload, metadatas)
-
-
-def readTableRules(p4info_helper, sw):
-    """
-    Reads and logs all table entries from the switch.
-    """
-    log.info(f'\n----- Reading tables rules for {sw.name} -----')
-    for response in sw.ReadTableEntries():
-        for entity in response.entities:
-            entry = entity.table_entry
-            log.info(entry)
-            log.info('-----')
 
 
 def printCounter(p4info_helper, sw, counter_name, index):
@@ -487,7 +382,6 @@ async def processPacket(message):
     dst_ip_addr = ipv4ToInt(ip_da_str)
     
     counter_index = int(pkt[IP].dst.split('.')[3])
-    flow_key = (src_ip_addr, dst_ip_addr, ip_proto)
 
     pktinfo = decodePacketInMetadata(global_data['cpm_packetin_id2data'], packet)
 
@@ -499,16 +393,6 @@ async def processPacket(message):
                  f"reason {reason} for flow: {ip_sa_str} -> {ip_da_str}")
         return counter_index
 
-    # ### DISABLED IDLE TIMEOUT ### (No lock needed, we'll just install every time)
-    # async with global_data['flow_lock']:
-    #     if flow_key in global_data['active_flows']:
-    #         log.info(f"Flow {ip_sa_str} -> {ip_da_str} already being processed "
-    #                  "or installed, ignoring PacketIn.")
-    #         return counter_index
-        
-    #     # Mark flow as "installing" to block other PacketIns
-    #     global_data['active_flows'][flow_key] = None
-
     log.info(f"Processing FLOW_UNKNOWN PacketIn from {ingress_sw_name} "
              f"for flow: {ip_sa_str} -> {ip_da_str}")
 
@@ -516,9 +400,6 @@ async def processPacket(message):
     if not path:
         log.error(f"Could not find path for {ip_sa_str} -> {ip_da_str}. "
                   "Packet will be dropped.")
-        # ### DISABLED IDLE TIMEOUT ###
-        # async with global_data['flow_lock']:
-        #     del global_data['active_flows'][flow_key]
         return counter_index
 
     final_dest_mac = global_data['host_info'][ip_da_str]['mac']
@@ -549,10 +430,6 @@ async def processPacket(message):
         install_tasks.append(task)
 
     await asyncio.gather(*install_tasks)
-    
-    # ### DISABLED IDLE TIMEOUT ###
-    # async with global_data['flow_lock']:
-    #     global_data['active_flows'][flow_key] = path
 
     if packet_out_port is not None:
         log.info(f"Sending PacketOut to {ingress_sw_name} to forward "
@@ -590,10 +467,6 @@ async def processNotif(notif_queue):
                     printCounter(global_data['p4info_helper'], notif["sw"],
                                  'MyEgress.egressPktInCounter', read_index)
             
-            # ### DISABLED IDLE TIMEOUT ###
-            # elif notif["type"] == "idle-notif":
-            #     log.info("Idle timeout notification received, but functionality is disabled.")
-            
             notif_queue.task_done()
         except Exception as e:
             log.error(f"Unexpected error in processNotif loop: {e}")
@@ -620,27 +493,6 @@ async def packetInHandler(notif_queue, sw):
             traceback.print_exc()
             await asyncio.sleep(1)
 
-# ### DISABLED IDLE TIMEOUT ###
-# async def idleTimeHandler(notif_queue, sw):
-#     """Listens for IdleTimeout notifications from a switch."""
-#     while True:
-#         try:
-#             idle_notif = await asyncio.to_thread(sw.IdleTimeoutNotification)
-#             message = {"type": "idle-notif", "sw": sw, "idle": idle_notif}
-#             await notif_queue.put(message)
-#         except grpc.RpcError as e:
-#             if e.code() != grpc.StatusCode.CANCELLED:
-#                 log.warning(f"[gRPC Error in idleTimeHandler for {sw.name}]")
-#                 printGrpcError(e)
-#             else:
-#                 log.info(f"IdleTimeout stream cancelled for {sw.name}.")
-#                 break
-#             await asyncio.sleep(1)
-#         except Exception as e:
-#             log.error(f"[Unexpected Error in idleTimeHandler for {sw.name}]: {e}")
-#             traceback.print_exc()
-#             await asyncio.sleep(1)
-
 
 def printGrpcError(e):
     log.error(f"gRPC Error: {e.details()} (code: {e.code().name})")
@@ -663,19 +515,15 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
         traceback.print_exc()
         sys.exit(1)
 
-    # ### FIXED: Added the try...except block back
     try:
         # --- DYNAMIC SWITCH CONNECTION ---
         global_data['switches'] = {}
-        switch_names = sorted(global_data['topology']['switches'].keys())
         all_switches = []
-        device_id_counter = 0
         grpc_port_base = 50051  # Standard base port
 
-        for sw_name in switch_names:
-            device_id = device_id_counter
+        switch_names = sorted(global_data['topology']['switches'].keys())
+        for device_id, sw_name in enumerate(switch_names):
             grpc_port = grpc_port_base + device_id
-            
             sw = p4runtime_lib.bmv2.Bmv2SwitchConnection(
                 name=sw_name,
                 address=f'127.0.0.1:{grpc_port}',
@@ -684,7 +532,6 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
             )
             global_data['switches'][sw_name] = sw
             all_switches.append(sw)
-            device_id_counter += 1
         
         for sw in all_switches:
             sw.MasterArbitrationUpdate()
@@ -720,8 +567,6 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
         tasks = [asyncio.create_task(processNotif(notif_queue))]
         for sw in all_switches:
             tasks.append(asyncio.create_task(packetInHandler(notif_queue, sw)))
-            # ### DISABLED IDLE TIMEOUT ###
-            # tasks.append(asyncio.create_task(idleTimeHandler(notif_queue, sw)))
         
         await asyncio.gather(*tasks)
 
@@ -744,7 +589,7 @@ if __name__ == '__main__':
     parser.add_argument('--bmv2-json', help='BMv2 JSON file from p4c',
                         type=str, action="store", required=False,
                         default='./build/flowcache.json')
-    parser.add_argument('--topo', help='Topology JSON file', # ### FIXED: 'add_gument' typo
+    parser.add_argument('--topo', help='Topology JSON file',
                         type=str, action="store", required=False,
                         default='topology.json')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
