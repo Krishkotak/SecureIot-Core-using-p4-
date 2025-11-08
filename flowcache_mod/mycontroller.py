@@ -46,10 +46,6 @@ global_data['host_info'] = {}
 global_data['link_info'] = {}
 global_data['path_cache'] = {}
 
-# ### DISABLED IDLE TIMEOUT ###
-# global_data['flow_lock'] = asyncio.Lock()
-# global_data['active_flows'] = {}
-
 
 def load_topology(topo_file_path):
     """Loads and parses the topology.json file."""
@@ -63,7 +59,8 @@ def load_topology(topo_file_path):
     host_info = {}
     for h_name, h_details in topo['hosts'].items():
         ip = h_details['ip'].split('/')[0]
-        host_info[ip] = {'name': h_name, 'mac': h_details['mac']}
+        mac = h_details['mac']
+        host_info[mac] = {'name': h_name, 'ip': ip, 'mac': mac}
 
     link_info = {}
     for link in topo['links']:
@@ -80,7 +77,7 @@ def load_topology(topo_file_path):
 
         if node1_name.startswith('h'):
             h_name, sw_name, sw_port = node1_name, node2_name, node2_port
-            for ip, info in host_info.items():
+            for mac, info in host_info.items():
                 if info['name'] == h_name:
                     info['switch'] = sw_name
                     info['port'] = sw_port
@@ -90,7 +87,7 @@ def load_topology(topo_file_path):
 
         elif node2_name.startswith('h'):
             h_name, sw_name, sw_port = node2_name, node1_name, node1_port
-            for ip, info in host_info.items():
+            for mac, info in host_info.items():
                 if info['name'] == h_name:
                     info['switch'] = sw_name
                     info['port'] = sw_port
@@ -111,24 +108,25 @@ def load_topology(topo_file_path):
     log.info(pprint.pformat(global_data['link_info']))
 
 
-def get_path(src_ip, dst_ip):
+def get_path(src_mac, dst_mac):
     """
     Performs a BFS on the topology to find a simple path.
     Caches results in global_data['path_cache'].
+    Now uses MAC addresses instead of IP addresses.
     """
-    path_key = (src_ip, dst_ip)
+    path_key = (src_mac, dst_mac)
     if path_key in global_data['path_cache']:
         return global_data['path_cache'][path_key]
 
     graph = global_data['link_info']
     host_info = global_data['host_info']
 
-    if src_ip not in host_info or dst_ip not in host_info:
-        log.error(f"Error: IP {src_ip} or {dst_ip} not found in host_info")
+    if src_mac not in host_info or dst_mac not in host_info:
+        log.error(f"Error: MAC {src_mac} or {dst_mac} not found in host_info")
         return None
 
-    src_switch = host_info[src_ip]['switch']
-    dst_switch = host_info[dst_ip]['switch']
+    src_switch = host_info[src_mac]['switch']
+    dst_switch = host_info[dst_mac]['switch']
 
     if src_switch == dst_switch:
         path = [src_switch]
@@ -157,6 +155,17 @@ def get_path(src_ip, dst_ip):
     return None
 
 
+def macToInt(mac_str):
+    """Converts a MAC address string to an integer."""
+    return int(mac_str.replace(':', ''), 16)
+
+
+def intToMac(mac_int):
+    """Converts an integer to a MAC address string."""
+    mac_hex = format(mac_int, '012x')
+    return ':'.join(mac_hex[i:i+2] for i in range(0, 12, 2))
+
+
 def ipv4ToInt(addr):
     """Converts a dotted-decimal IPv4 string to an integer."""
     return int.from_bytes(socket.inet_aton(addr), byteorder='big')
@@ -170,6 +179,7 @@ def intToIpv4(n):
 def flowCacheEntryToDebugStr(table_entry):
     """
     Generates a P4Info-aware debug string for a flow_cache table entry.
+    Now includes source MAC, destination IP, and ingress port.
     """
     p4info_helper = global_data['p4info_helper']
     table_name = "MyIngress.flow_cache"
@@ -181,39 +191,44 @@ def flowCacheEntryToDebugStr(table_entry):
         if field_name == "hdr.ipv4.protocol":
             val = int.from_bytes(match_field.exact.value, byteorder='big')
             parts.append(f"proto={val}")
-        elif field_name == "hdr.ipv4.srcAddr":
-            val = intToIpv4(int(ipaddress.IPv4Address(match_field.exact.value)))
-            parts.append(f"SA={val}")
+        elif field_name == "hdr.ethernet.srcAddr":
+            val = intToMac(int.from_bytes(match_field.exact.value, byteorder='big'))
+            parts.append(f"SrcMAC={val}")
         elif field_name == "hdr.ipv4.dstAddr":
             val = intToIpv4(int(ipaddress.IPv4Address(match_field.exact.value)))
-            parts.append(f"DA={val}")
+            parts.append(f"DstIP={val}")
+        elif field_name == "standard_metadata.ingress_port":
+            val = int.from_bytes(match_field.exact.value, byteorder='big')
+            parts.append(f"InPort={val}")
             
     return f"({', '.join(parts)})"
 
 
 def get_flow_key_from_table_entry(table_entry):
     """
-    Extracts the (src_ip_int, dst_ip_int, proto) tuple from a table entry.
+    Extracts the (src_mac_int, dst_ip_int, ingress_port, proto) tuple from a table entry.
     """
     p4info_helper = global_data['p4info_helper']
     table_name = "MyIngress.flow_cache"
     
-    src_ip, dst_ip, proto = None, None, None
+    src_mac, dst_ip, ingress_port, proto = None, None, None, None
     
     for match_field in table_entry.match:
         field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
         if field_name == "hdr.ipv4.protocol":
             proto = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ipv4.srcAddr":
-            src_ip = int(ipaddress.IPv4Address(match_field.exact.value))
+        elif field_name == "hdr.ethernet.srcAddr":
+            src_mac = int.from_bytes(match_field.exact.value, byteorder='big')
         elif field_name == "hdr.ipv4.dstAddr":
             dst_ip = int(ipaddress.IPv4Address(match_field.exact.value))
+        elif field_name == "standard_metadata.ingress_port":
+            ingress_port = int.from_bytes(match_field.exact.value, byteorder='big')
     
-    if src_ip is None or dst_ip is None or proto is None:
+    if src_mac is None or dst_ip is None or ingress_port is None or proto is None:
         log.warning(f"Could not parse full flow key from table entry: {table_entry}")
         return None
         
-    return (src_ip, dst_ip, proto)
+    return (src_mac, dst_ip, ingress_port, proto)
 
 
 def decodePacketInMetadata(pktin_info, packet):
@@ -286,32 +301,32 @@ def writeCloneSession(sw, clone_session_id, replicas):
     sw.WritePREEntry(clone_entry)
 
 
-async def addFlowRule(ingress_sw, src_ip_addr, dst_ip_addr, protocol, port,
-                      new_dscp, decrement_ttl_bool, dst_eth_addr):
+async def addFlowRule(ingress_sw, src_mac_addr, dst_ip_addr, ingress_port, protocol, 
+                      egress_port, new_dscp, decrement_ttl_bool, dst_eth_addr):
     """
     Builds and installs a flow rule in the flow cache table with retry.
+    Now matches on source MAC, destination IP, and ingress port.
     """
     table_entry = global_data['p4info_helper'].buildTableEntry(
         table_name="MyIngress.flow_cache",
         match_fields={
-            "hdr.ipv4.protocol": protocol,
-            "hdr.ipv4.srcAddr": src_ip_addr,
-            "hdr.ipv4.dstAddr": dst_ip_addr
+            "hdr.ethernet.srcAddr": src_mac_addr,
+            "hdr.ipv4.dstAddr": dst_ip_addr,
+            "standard_metadata.ingress_port": ingress_port,
+            "hdr.ipv4.protocol": protocol
         },
         action_name="MyIngress.cached_action",
         action_params={
-            "port":           port,
+            "port":           egress_port,
             "decrement_ttl":  1 if decrement_ttl_bool else 0,
             "new_dscp":       new_dscp,
             "dst_eth_addr":   dst_eth_addr
         }
-        # ### DISABLED IDLE TIMEOUT ###
-        # idle_timeout_ns=3 * NSEC_PER_SEC
     )
     
     log.info(f"Installing rule on {ingress_sw.name}: "
              f"{flowCacheEntryToDebugStr(table_entry)} -> "
-             f"port {port}, mac {dst_eth_addr}")
+             f"egress_port {egress_port}, dst_mac {dst_eth_addr}")
     
     await write_table_entry(ingress_sw, table_entry)
 
@@ -357,8 +372,12 @@ def createFlowRule(notif):
         
         if field_name == "hdr.ipv4.protocol":
             value = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ipv4.srcAddr" or field_name == "hdr.ipv4.dstAddr":
+        elif field_name == "hdr.ethernet.srcAddr":
+            value = int.from_bytes(match_field.exact.value, byteorder='big')
+        elif field_name == "hdr.ipv4.dstAddr":
             value = int(ipaddress.IPv4Address(match_field.exact.value))
+        elif field_name == "standard_metadata.ingress_port":
+            value = int.from_bytes(match_field.exact.value, byteorder='big')
         else:
             value = p4info_helper.get_match_field_value(match_field)
             
@@ -459,30 +478,44 @@ def printCounter(p4info_helper, sw, counter_name, index):
         log.error(f"[Unexpected Error in printCounter for {sw.name}]: {e}")
         traceback.print_exc()
 
-def is_device_authenticated(dst_ip, src_mac):
+
+def is_device_authenticated(src_mac, dst_ip, ingress_port):
     """
-    Checks if a device (IP, MAC) pair is allowed on the network.
-    Uses global_data['allowed_devices'] which maps allowed MACs to their IPs and services.
+    Checks if a device is allowed based on source MAC, destination IP, and ingress port.
+    Uses global_data['allowed_devices'] which maps allowed MACs to their allowed destinations and ports.
     """
     allowed = global_data.get('allowed_devices', {})
 
-    if src_mac in allowed:
-        expected_ip = allowed[src_mac]['ip']
-        if expected_ip == dst_ip:
-            print(f"[Auth] Device {src_mac}  authenticated for service {allowed[src_mac]['service']} on ip {dst_ip}")
-            return True
-        else:
-            print(f"[Auth] Device {src_mac} has mismatched IP (expected {expected_ip}, got {dst_ip})")
-            return False
-    else:
-        print(f"[Auth] Unknown device {src_mac}, rejecting.")
+    if src_mac not in allowed:
+        log.warning(f"[Auth] Unknown device MAC {src_mac}, rejecting.")
         return False
+    
+    device_info = allowed[src_mac]
+    expected_ip = device_info['ip']
+    expected_port = device_info.get('port', None)
+    
+    # Check destination IP
+    if expected_ip != dst_ip:
+        log.warning(f"[Auth] Device {src_mac} unauthorized for destination IP {dst_ip} "
+                    f"(expected {expected_ip})")
+        return False
+    
+    # Check ingress port if specified
+    if expected_port is not None and expected_port != ingress_port:
+        log.warning(f"[Auth] Device {src_mac} on wrong port {ingress_port} "
+                    f"(expected {expected_port})")
+        return False
+    
+    log.info(f"[Auth] Device {src_mac} authenticated for service {device_info['service']} "
+             f"on IP {dst_ip}, port {ingress_port}")
+    return True
 
 
 async def processPacket(message):
     """
     Processes a PacketIn message.
-    Authenticates (src_mac, dst_ip) pairs and installs bidirectional flow rules.
+    Authenticates (src_mac, dst_ip, ingress_port) tuples and installs bidirectional flow rules.
+    Now uses source MAC, destination IP, and ingress port for flow identification.
     """
     payload = message["packet-in"].payload
     packet = message["packet-in"]
@@ -498,47 +531,72 @@ async def processPacket(message):
         return None
 
     ip_proto = pkt[IP].proto
-    ip_sa_str = pkt[IP].src
     ip_da_str = pkt[IP].dst
-    src_ip_addr = ipv4ToInt(ip_sa_str)
+    src_mac_str = pkt[Ether].src
+    dst_mac_str = pkt[Ether].dst
+    
+    src_mac_int = macToInt(src_mac_str)
     dst_ip_addr = ipv4ToInt(ip_da_str)
     counter_index = int(pkt[IP].dst.split('.')[3])
-    flow_key = (src_ip_addr, dst_ip_addr, ip_proto)
 
     pktinfo = decodePacketInMetadata(global_data['cpm_packetin_id2data'], packet)
+    
+    # Extract ingress port from packet metadata
+    # Extract ingress port from packet metadata
+    ingress_port = pktinfo['metadata'].get('input_port', None)
+    if ingress_port is None:
+        log.error("Could not extract input_port from PacketIn metadata. Dropping packet.")
+        return counter_index
+
+    flow_key = (src_mac_int, dst_ip_addr, ingress_port, ip_proto)
 
     # Ignore PacketIns that aren't flow-miss
     if pktinfo['metadata']['punt_reason'] != global_data['punt_reason_name2int']['FLOW_UNKNOWN']:
         reason = global_data['punt_reason_int2name'].get(pktinfo['metadata']['punt_reason'], 'UNKNOWN')
-        log.info(f"Ignoring PacketIn from {ingress_sw_name} with reason {reason} for flow: {ip_sa_str} -> {ip_da_str}")
+        log.info(f"Ignoring PacketIn from {ingress_sw_name} with reason {reason} for flow: "
+                 f"{src_mac_str} -> {ip_da_str} (port {ingress_port})")
         return counter_index
 
-    log.info(f"Processing FLOW_UNKNOWN PacketIn from {ingress_sw_name} for flow: {ip_sa_str} -> {ip_da_str}")
+    log.info(f"Processing FLOW_UNKNOWN PacketIn from {ingress_sw_name} for flow: "
+             f"{src_mac_str} -> {ip_da_str} (ingress_port {ingress_port})")
 
     # --- AUTHENTICATION CHECK ---
-    src_mac = pkt.src
-    if not is_device_authenticated(ip_da_str, src_mac):
-        log.warning(f"[SECURITY] Unauthorized device {src_mac} attempting to send packet from {ip_sa_str}. Dropping.")
-        return
+    if not is_device_authenticated(src_mac_str, ip_da_str, ingress_port):
+        log.warning(f"[SECURITY] Unauthorized device {src_mac_str} attempting to access {ip_da_str} "
+                    f"on port {ingress_port}. Dropping.")
+        return counter_index
     # --- END AUTHENTICATION CHECK ---
 
     # --- PATH COMPUTATION ---
-    path = get_path(ip_sa_str, ip_da_str)
-    if not path:
-        log.error(f"Could not find path for {ip_sa_str} -> {ip_da_str}. Packet will be dropped.")
+    # Find destination MAC from host_info
+    dst_mac_from_ip = None
+    for mac, info in global_data['host_info'].items():
+        if info['ip'] == ip_da_str:
+            dst_mac_from_ip = mac
+            break
+    
+    if dst_mac_from_ip is None:
+        log.error(f"Could not find MAC for destination IP {ip_da_str}. Packet will be dropped.")
         return counter_index
 
-    final_dest_mac = global_data['host_info'][ip_da_str]['mac']
+    path = get_path(src_mac_str, dst_mac_from_ip)
+    if not path:
+        log.error(f"Could not find path for {src_mac_str} -> {dst_mac_from_ip}. Packet will be dropped.")
+        return counter_index
+
+    final_dest_mac = dst_mac_from_ip
     packet_out_port = None
 
     # --- FORWARD FLOW INSTALLATION (src -> dst) ---
     forward_tasks = []
+    current_ingress_port = ingress_port
+    
     for i in range(len(path)):
         current_switch_name = path[i]
         current_switch_obj = global_data['switches'][current_switch_name]
 
         if i == len(path) - 1:
-            dest_host_name = global_data['host_info'][ip_da_str]['name']
+            dest_host_name = global_data['host_info'][dst_mac_from_ip]['name']
             output_port = global_data['link_info'][current_switch_name][dest_host_name]
             dest_mac = final_dest_mac
         else:
@@ -550,23 +608,34 @@ async def processPacket(message):
             packet_out_port = output_port
 
         forward_tasks.append(addFlowRule(
-            current_switch_obj, src_ip_addr, dst_ip_addr, ip_proto,
+            current_switch_obj, src_mac_int, dst_ip_addr, current_ingress_port, ip_proto,
             output_port, new_dscp=5, decrement_ttl_bool=True, dst_eth_addr=dest_mac))
+        
+        # For next switch in path, the ingress port is the port connected from current switch
+        if i < len(path) - 1:
+            next_switch_name = path[i + 1]
+            current_ingress_port = global_data['link_info'][next_switch_name][current_switch_name]
 
     # --- REVERSE FLOW INSTALLATION (dst -> src) ---
     reverse_tasks = []
-    reverse_src_ip_addr = dst_ip_addr
-    reverse_dst_ip_addr = src_ip_addr
-    reverse_src_mac = final_dest_mac
-    reverse_dst_mac = pkt.src
+    reverse_src_mac_int = macToInt(dst_mac_from_ip)
+    # Get source IP for reverse flow
+    src_ip_str = pkt[IP].src
+    reverse_dst_ip_addr = ipv4ToInt(src_ip_str)
+    reverse_dst_mac = src_mac_str
 
     reverse_path = list(reversed(path))
+    
+    # For reverse path, ingress port at destination host's switch
+    dest_host_name = global_data['host_info'][dst_mac_from_ip]['name']
+    reverse_ingress_port = global_data['link_info'][reverse_path[0]][dest_host_name]
+    
     for i in range(len(reverse_path)):
         current_switch_name = reverse_path[i]
         current_switch_obj = global_data['switches'][current_switch_name]
 
         if i == len(reverse_path) - 1:
-            dest_host_name = global_data['host_info'][ip_sa_str]['name']
+            dest_host_name = global_data['host_info'][src_mac_str]['name']
             output_port = global_data['link_info'][current_switch_name][dest_host_name]
             dest_mac = reverse_dst_mac
         else:
@@ -575,8 +644,13 @@ async def processPacket(message):
             dest_mac = reverse_dst_mac
 
         reverse_tasks.append(addFlowRule(
-            current_switch_obj, reverse_src_ip_addr, reverse_dst_ip_addr, ip_proto,
-            output_port, new_dscp=5, decrement_ttl_bool=True, dst_eth_addr=dest_mac))
+            current_switch_obj, reverse_src_mac_int, reverse_dst_ip_addr, reverse_ingress_port, 
+            ip_proto, output_port, new_dscp=5, decrement_ttl_bool=True, dst_eth_addr=dest_mac))
+        
+        # For next switch in reverse path, the ingress port is the port connected from current switch
+        if i < len(reverse_path) - 1:
+            next_switch_name = reverse_path[i + 1]
+            reverse_ingress_port = global_data['link_info'][next_switch_name][current_switch_name]
 
     # Install both directions concurrently
     await asyncio.gather(*(forward_tasks + reverse_tasks))
@@ -690,15 +764,29 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
         traceback.print_exc()
         sys.exit(1)
 
-    # ### FIXED: Added the try...except block back
     try:
         # --- DYNAMIC SWITCH CONNECTION ---
         global_data['switches'] = {}
+        
+        # --- MODIFIED FOR PORT-BASED AUTH ---
+        # This is the static auth list
         global_data['allowed_devices'] = {
-    "08:00:00:00:01:11": {"ip": "10.0.2.2", "service": "sensing"},
-    "08:00:00:00:02:22": {"ip": "10.0.3.3", "service": "actuating"},
-    "08:00:00:00:03:33": {"ip": "10.0.1.1", "service": "analytics"}
-}
+            "08:00:00:00:01:11": {"ip": "10.0.2.2", "service": "sensing"},
+            "08:00:00:00:02:22": {"ip": "10.0.3.3", "service": "actuating"},
+            "08:00:00:00:03:33": {"ip": "10.0.1.1", "service": "analytics"}
+        }
+
+        # Augment allowed_devices with port info from topology
+        # This fulfills the prompt to check ingress_port
+        log.info("Augmenting allowed devices with port info from topology...")
+        host_info = global_data.get('host_info', {})
+        for mac, auth_info in global_data['allowed_devices'].items():
+            if mac in host_info:
+                auth_info['port'] = host_info[mac]['port']
+                log.info(f"  -> Set expected port {auth_info['port']} for {mac}")
+            else:
+                log.warning(f"  -> MAC {mac} from allowed_devices not in topology host_info!")
+        # --- END MODIFICATION ---
 
         switch_names = sorted(global_data['topology']['switches'].keys())
         all_switches = []
@@ -743,7 +831,7 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
             serializableEnumDict(p4info_helper.p4info, 'ControllerOpcode_t')
 
         # Configure clone session for Packet-In
-        replicas = [{"egress_port": global_data['CPU_PORT'], "instance": 1}]
+        replicas = [{"egress_port": global_data['CPU_PORT'], "instance": 1}] # <-- Fixed key from CPU_port
         for sw in all_switches:
             writeCloneSession(sw, global_data['CPU_PORT_CLONE_SESSION_ID'], replicas)
         log.info("Configured clone sessions for Packet-In on all switches")
@@ -777,7 +865,7 @@ if __name__ == '__main__':
     parser.add_argument('--bmv2-json', help='BMv2 JSON file from p4c',
                         type=str, action="store", required=False,
                         default='./build/flowcache.json')
-    parser.add_argument('--topo', help='Topology JSON file', # ### FIXED: 'add_gument' typo
+    parser.add_argument('--topo', help='Topology JSON file',
                         type=str, action="store", required=False,
                         default='topology.json')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
