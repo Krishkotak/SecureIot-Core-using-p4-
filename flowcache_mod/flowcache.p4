@@ -147,7 +147,7 @@ parser MyParser(packet_in packet,
 }
 
 /*************************************************************************
-************   C H E C K S U M    V E R I F I C A T I O N   *************
+************ C H E C K S U M    V E R I F I C A T I O N   *************
 *************************************************************************/
 control MyVerifyChecksum(inout headers_t hdr, inout metadata_t meta) {
     apply {
@@ -168,7 +168,7 @@ control MyVerifyChecksum(inout headers_t hdr, inout metadata_t meta) {
 }
 
 /*************************************************************************
-**************  I N G R E S S   P R O C E S S I N G   *******************
+************** I N G R E S S   P R O C E S S I N G   *******************
 *************************************************************************/
 
 control MyIngress(inout headers_t hdr,
@@ -216,9 +216,12 @@ control MyIngress(inout headers_t hdr,
     }
     table flow_cache {
         key = {
-            hdr.ipv4.protocol : exact;
-            hdr.ipv4.srcAddr : exact;
-            hdr.ipv4.dstAddr : exact;
+            // --- MODIFICATION: Match controller's logic ---
+            hdr.ethernet.srcAddr:           exact;
+            hdr.ipv4.dstAddr:               exact;
+            standard_metadata.ingress_port: exact;
+            hdr.ipv4.protocol:              exact;
+            // --- END MODIFICATION ---
         }
         actions = {
             cached_action;
@@ -248,6 +251,8 @@ control MyIngress(inout headers_t hdr,
                 }
             }
         } else if (hdr.ipv4.isValid()) {
+            // We check ipv4.isValid, which implies ethernet.isValid
+            // was also true, so we can safely access ethernet.srcAddr
             flow_cache.apply();
         } else {
             // This is a toy demo.  It drops all packets that are not
@@ -258,7 +263,7 @@ control MyIngress(inout headers_t hdr,
 }
 
 /*************************************************************************
-****************  E G R E S S   P R O C E S S I N G   *******************
+**************** E G R E S S   P R O C E S S I N G   *******************
 *************************************************************************/
 
 control MyEgress(inout headers_t hdr,
@@ -287,7 +292,7 @@ control MyEgress(inout headers_t hdr,
 }
 
 /*************************************************************************
-*************   C H E C K S U M    C O M P U T A T I O N   **************
+************* C H E C K S U M    C O M P U T A T I O N   **************
 *************************************************************************/
 
 control MyComputeChecksum(inout headers_t hdr, inout metadata_t meta) {
@@ -311,7 +316,7 @@ control MyComputeChecksum(inout headers_t hdr, inout metadata_t meta) {
 }
 
 /*************************************************************************
-***********************  D E P A R S E R  *******************************
+*********************** D E P A R S E R  *******************************
 *************************************************************************/
 
 control MyDeparser(packet_out packet, in headers_t hdr) {
@@ -323,7 +328,7 @@ control MyDeparser(packet_out packet, in headers_t hdr) {
 }
 
 /*************************************************************************
-***********************  S W I T C H  *******************************
+*********************** S W I T C H  *******************************
 *************************************************************************/
 
 V1Switch(
