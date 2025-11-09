@@ -5,13 +5,12 @@ import os
 import sys
 import asyncio
 import traceback
-import time
 import ipaddress
 import pprint
 import json
 import logging
+import socket
 from collections import Counter
-from datetime import datetime, timedelta
 from scapy.all import *
 
 import grpc
@@ -23,7 +22,6 @@ sys.path.append(
 import p4runtime_lib.bmv2
 import p4runtime_lib.helper
 from p4runtime_lib.switch import ShutdownAllSwitchConnections
-import p4runtime_sh.p4runtime as shp4rt
 
 # --- Setup standard Python logging ---
 log = logging.getLogger('P4Controller')
@@ -33,7 +31,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-NSEC_PER_SEC = 1000 * 1000 * 1000
 RETRY_TIMES = 3
 RETRY_SLEEP_SEC = 0.1
 
@@ -45,6 +42,35 @@ global_data['topology'] = {}
 global_data['host_info'] = {}
 global_data['link_info'] = {}
 global_data['path_cache'] = {}
+
+# --- New Global Data for Authentication ---
+
+# 1. Device Authentication List (Device Profile)
+# *** MODIFIED as per user request (h1 -> h3 is disallowed) ***
+global_data['allowed_devices'] = {
+    "08:00:00:00:01:11": ["10.0.2.2", "10.0.4.4"], # h1 (CANNOT ping h3)
+    "08:00:00:00:02:22": ["10.0.1.1", "10.0.3.3", "10.0.4.4"], # h2
+    "08:00:00:00:03:33": ["10.0.2.2", "10.0.4.4"], # h3
+    "08:00:00:00:04:44": ["10.0.1.1", "10.0.2.2", "10.0.3.3"]  # h4
+}
+
+# 2. Cache for generated tags
+# Format: (src_mac, dst_ip) -> tag
+global_data['flow_tags'] = {}
+global_data['next_tag_id'] = 1000 # Start tag IDs from 1000
+
+# 3. Cache for installed validation rules to prevent duplicates
+# Format: (switch_name, tag) -> True
+global_data['tag_validation_rules'] = {}
+
+# 4. Cache for installed device auth rules
+# Format: (switch_name, src_mac, dst_ip) -> True
+global_data['flow_auth_rules'] = {}
+
+# 5. *** NEW CACHE *** for proactive drop rules
+# Format: (switch_name, src_mac, dst_ip) -> True
+global_data['flow_drop_rules'] = {}
+# --- End New Global Data ---
 
 
 def load_topology(topo_file_path):
@@ -59,41 +85,40 @@ def load_topology(topo_file_path):
     host_info = {}
     for h_name, h_details in topo['hosts'].items():
         ip = h_details['ip'].split('/')[0]
-        mac = h_details['mac']
-        host_info[mac] = {'name': h_name, 'ip': ip, 'mac': mac}
+        host_info[ip] = {'name': h_name, 'mac': h_details['mac']}
 
     link_info = {}
+
+    def parse_node(node):
+        """Helper to parse node strings like 's1-p1'"""
+        if '-p' in node:
+            parts = node.split('-p')
+            return parts[0], int(parts[1])
+        return node, None
+
     for link in topo['links']:
         node1, node2 = link[0], link[1]
-
-        def parse_node(node):
-            if '-p' in node:
-                parts = node.split('-p')
-                return parts[0], int(parts[1])
-            return node, None
 
         node1_name, node1_port = parse_node(node1)
         node2_name, node2_port = parse_node(node2)
 
         if node1_name.startswith('h'):
             h_name, sw_name, sw_port = node1_name, node2_name, node2_port
-            for mac, info in host_info.items():
+            for ip, info in host_info.items():
                 if info['name'] == h_name:
                     info['switch'] = sw_name
                     info['port'] = sw_port
                     break
             link_info.setdefault(sw_name, {})[h_name] = sw_port
-            link_info.setdefault(h_name, {})[sw_name] = 0
 
         elif node2_name.startswith('h'):
             h_name, sw_name, sw_port = node2_name, node1_name, node1_port
-            for mac, info in host_info.items():
+            for ip, info in host_info.items():
                 if info['name'] == h_name:
                     info['switch'] = sw_name
                     info['port'] = sw_port
                     break
             link_info.setdefault(sw_name, {})[h_name] = sw_port
-            link_info.setdefault(h_name, {})[sw_name] = 0
 
         elif node1_name.startswith('s') and node2_name.startswith('s'):
             sw1_name, sw1_port = node1_name, node1_port
@@ -108,25 +133,24 @@ def load_topology(topo_file_path):
     log.info(pprint.pformat(global_data['link_info']))
 
 
-def get_path(src_mac, dst_mac):
+def get_path(src_ip, dst_ip):
     """
     Performs a BFS on the topology to find a simple path.
     Caches results in global_data['path_cache'].
-    Now uses MAC addresses instead of IP addresses.
     """
-    path_key = (src_mac, dst_mac)
+    path_key = (src_ip, dst_ip)
     if path_key in global_data['path_cache']:
         return global_data['path_cache'][path_key]
 
     graph = global_data['link_info']
     host_info = global_data['host_info']
 
-    if src_mac not in host_info or dst_mac not in host_info:
-        log.error(f"Error: MAC {src_mac} or {dst_mac} not found in host_info")
+    if src_ip not in host_info or dst_ip not in host_info:
+        log.error(f"Error: IP {src_ip} or {dst_ip} not found in host_info")
         return None
 
-    src_switch = host_info[src_mac]['switch']
-    dst_switch = host_info[dst_mac]['switch']
+    src_switch = host_info[src_ip]['switch']
+    dst_switch = host_info[dst_ip]['switch']
 
     if src_switch == dst_switch:
         path = [src_switch]
@@ -154,17 +178,14 @@ def get_path(src_mac, dst_mac):
     log.error(f"Error: No path found from {src_switch} to {dst_switch}")
     return None
 
-
-def macToInt(mac_str):
-    """Converts a MAC address string to an integer."""
-    return int(mac_str.replace(':', ''), 16)
-
-
-def intToMac(mac_int):
-    """Converts an integer to a MAC address string."""
-    mac_hex = format(mac_int, '012x')
-    return ':'.join(mac_hex[i:i+2] for i in range(0, 12, 2))
-
+# --- Helper function to generate deterministic MACs for switch ports ---
+def get_port_mac(switch_name, port_num):
+    """
+    Generates a deterministic MAC address for a switch port.
+    e.g., s1, port 2 -> "00:AA:BB:01:02:00"
+    """
+    sw_id = int(switch_name[1:])
+    return f"00:AA:BB:{sw_id:02X}:{port_num:02X}:00"
 
 def ipv4ToInt(addr):
     """Converts a dotted-decimal IPv4 string to an integer."""
@@ -174,61 +195,6 @@ def ipv4ToInt(addr):
 def intToIpv4(n):
     """Converts a 32-bit integer to a dotted-decimal IPv4 string."""
     return socket.inet_ntoa(n.to_bytes(4, byteorder='big'))
-
-
-def flowCacheEntryToDebugStr(table_entry):
-    """
-    Generates a P4Info-aware debug string for a flow_cache table entry.
-    Now includes source MAC, destination IP, and ingress port.
-    """
-    p4info_helper = global_data['p4info_helper']
-    table_name = "MyIngress.flow_cache"
-    
-    parts = []
-    for match_field in table_entry.match:
-        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
-        
-        if field_name == "hdr.ipv4.protocol":
-            val = int.from_bytes(match_field.exact.value, byteorder='big')
-            parts.append(f"proto={val}")
-        elif field_name == "hdr.ethernet.srcAddr":
-            val = intToMac(int.from_bytes(match_field.exact.value, byteorder='big'))
-            parts.append(f"SrcMAC={val}")
-        elif field_name == "hdr.ipv4.dstAddr":
-            val = intToIpv4(int(ipaddress.IPv4Address(match_field.exact.value)))
-            parts.append(f"DstIP={val}")
-        elif field_name == "standard_metadata.ingress_port":
-            val = int.from_bytes(match_field.exact.value, byteorder='big')
-            parts.append(f"InPort={val}")
-            
-    return f"({', '.join(parts)})"
-
-
-def get_flow_key_from_table_entry(table_entry):
-    """
-    Extracts the (src_mac_int, dst_ip_int, ingress_port, proto) tuple from a table entry.
-    """
-    p4info_helper = global_data['p4info_helper']
-    table_name = "MyIngress.flow_cache"
-    
-    src_mac, dst_ip, ingress_port, proto = None, None, None, None
-    
-    for match_field in table_entry.match:
-        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
-        if field_name == "hdr.ipv4.protocol":
-            proto = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ethernet.srcAddr":
-            src_mac = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ipv4.dstAddr":
-            dst_ip = int(ipaddress.IPv4Address(match_field.exact.value))
-        elif field_name == "standard_metadata.ingress_port":
-            ingress_port = int.from_bytes(match_field.exact.value, byteorder='big')
-    
-    if src_mac is None or dst_ip is None or ingress_port is None or proto is None:
-        log.warning(f"Could not parse full flow key from table entry: {table_entry}")
-        return None
-        
-    return (src_mac, dst_ip, ingress_port, proto)
 
 
 def decodePacketInMetadata(pktin_info, packet):
@@ -301,34 +267,99 @@ def writeCloneSession(sw, clone_session_id, replicas):
     sw.WritePREEntry(clone_entry)
 
 
-async def addFlowRule(ingress_sw, src_mac_addr, dst_ip_addr, ingress_port, protocol, 
-                      egress_port, new_dscp, decrement_ttl_bool, dst_eth_addr):
+async def add_flow_auth_rule(sw, src_mac, dst_ip, tag, port, dst_eth_addr):
     """
-    Builds and installs a flow rule in the flow cache table with retry.
-    Now matches on source MAC, destination IP, and ingress port.
+    Installs a rule in the flow_auth_table.
     """
+    rule_key = (sw.name, src_mac, dst_ip)
+    if rule_key in global_data['flow_auth_rules']:
+        log.debug(f"FlowAuth rule for ({src_mac}, {intToIpv4(dst_ip)}) already on {sw.name}. Skipping.")
+        return True # Return True to indicate success/idempotency
+
     table_entry = global_data['p4info_helper'].buildTableEntry(
-        table_name="MyIngress.flow_cache",
+        table_name="MyIngress.flow_auth_table",
         match_fields={
-            "hdr.ethernet.srcAddr": src_mac_addr,
-            "hdr.ipv4.dstAddr": dst_ip_addr,
-            "standard_metadata.ingress_port": ingress_port,
-            "hdr.ipv4.protocol": protocol
+            "hdr.ethernet.srcAddr": src_mac,
+            "hdr.ipv4.dstAddr": dst_ip
         },
-        action_name="MyIngress.cached_action",
+        action_name="MyIngress.apply_tag_and_forward",
         action_params={
-            "port":           egress_port,
-            "decrement_ttl":  1 if decrement_ttl_bool else 0,
-            "new_dscp":       new_dscp,
-            "dst_eth_addr":   dst_eth_addr
+            "tag": tag,
+            "port": port,
+            "dst_eth_addr": dst_eth_addr
         }
     )
+    log.info(f"Installing FlowAuth rule on {sw.name}: "
+             f"MAC {src_mac}, IP {intToIpv4(dst_ip)} -> attach tag {tag}, fwd port {port}, next_hop {dst_eth_addr}")
     
-    log.info(f"Installing rule on {ingress_sw.name}: "
-             f"{flowCacheEntryToDebugStr(table_entry)} -> "
-             f"egress_port {egress_port}, dst_mac {dst_eth_addr}")
+    if await write_table_entry(sw, table_entry):
+        global_data['flow_auth_rules'][rule_key] = True
+        return True
+    return False
+
+# *** NEW FUNCTION ***
+async def add_proactive_drop_rule(sw, src_mac, dst_ip):
+    """
+    Installs a proactive drop rule in the flow_auth_table.
+    """
+    rule_key = (sw.name, src_mac, dst_ip)
+    if rule_key in global_data['flow_drop_rules']:
+        log.debug(f"FlowDrop rule for ({src_mac}, {intToIpv4(dst_ip)}) already on {sw.name}. Skipping.")
+        return True
     
-    await write_table_entry(ingress_sw, table_entry)
+    table_entry = global_data['p4info_helper'].buildTableEntry(
+        table_name="MyIngress.flow_auth_table",
+        match_fields={
+            "hdr.ethernet.srcAddr": src_mac,
+            "hdr.ipv4.dstAddr": dst_ip
+        },
+        action_name="MyIngress.proactive_drop",
+        action_params={}
+    )
+    log.info(f"Installing FlowDrop rule on {sw.name}: "
+             f"MAC {src_mac}, IP {intToIpv4(dst_ip)} -> DROP")
+    
+    if await write_table_entry(sw, table_entry):
+        global_data['flow_drop_rules'][rule_key] = True
+        return True
+    return False
+
+
+async def add_tag_validation_rule(sw, tag, port, dst_eth_addr, is_final_hop):
+    """
+    Installs a rule in the validate_tag_table.
+    Selects the action based on whether this is the final hop.
+    """
+    rule_key = (sw.name, tag)
+    if rule_key in global_data['tag_validation_rules']:
+        log.debug(f"Tag validation rule for tag {tag} already on {sw.name}.")
+        return True # Return True to indicate success/idempotency
+
+    if is_final_hop:
+        action_name = "MyIngress.decapsulate_and_forward"
+        log_info_str = "DEC-FWD"
+    else:
+        action_name = "MyIngress.forward_tagged_flow"
+        log_info_str = "FWD-TAG"
+
+    table_entry = global_data['p4info_helper'].buildTableEntry(
+        table_name="MyIngress.validate_tag_table",
+        match_fields={
+            "hdr.auth_tag.tag": tag
+        },
+        action_name=action_name,
+        action_params={
+            "port": port,
+            "dst_eth_addr": dst_eth_addr
+        }
+    )
+    log.info(f"Installing TagValidate rule on {sw.name}: "
+             f"Tag {tag} -> {log_info_str} port {port}, next_hop {dst_eth_addr}")
+    
+    if await write_table_entry(sw, table_entry):
+        global_data['tag_validation_rules'][rule_key] = True
+        return True
+    return False
 
 
 async def write_table_entry(sw, table_entry):
@@ -341,7 +372,10 @@ async def write_table_entry(sw, table_entry):
             log.debug(f"Successfully wrote entry to {sw.name}")
             return True
         except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNKNOWN or e.code() == grpc.StatusCode.ALREADY_EXISTS:
+            if e.code() == grpc.StatusCode.ALREADY_EXISTS:
+                log.warning(f"Rule already exists on {sw.name}. Caching it.")
+                return True # Treat as success
+            if e.code() == grpc.StatusCode.UNKNOWN:
                 log.warning(f"gRPC error writing to {sw.name} (Attempt {i + 1}/{RETRY_TIMES}): {e.code().name}. Retrying...")
                 await asyncio.sleep(RETRY_SLEEP_SEC)
             else:
@@ -353,68 +387,6 @@ async def write_table_entry(sw, table_entry):
             traceback.print_exc()
             return False
     log.error(f"Failed to write entry to {sw.name} after {RETRY_TIMES} attempts.")
-    return False
-
-
-def createFlowRule(notif):
-    """
-    Creates a table_entry object from an idle timeout notification.
-    This version is P4Info-aware and robust.
-    """
-    p4info_helper = global_data['p4info_helper']
-    table_name = "MyIngress.flow_cache"
-    
-    match_fields_from_notif = {}
-    notif_entry = notif["idle"].table_entry[0]
-    
-    for match_field in notif_entry.match:
-        field_name = p4info_helper.get_match_field_name(table_name, match_field.field_id)
-        
-        if field_name == "hdr.ipv4.protocol":
-            value = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ethernet.srcAddr":
-            value = int.from_bytes(match_field.exact.value, byteorder='big')
-        elif field_name == "hdr.ipv4.dstAddr":
-            value = int(ipaddress.IPv4Address(match_field.exact.value))
-        elif field_name == "standard_metadata.ingress_port":
-            value = int.from_bytes(match_field.exact.value, byteorder='big')
-        else:
-            value = p4info_helper.get_match_field_value(match_field)
-            
-        match_fields_from_notif[field_name] = value
-
-    table_entry = p4info_helper.buildTableEntry(
-        table_name=table_name,
-        match_fields=match_fields_from_notif
-    )
-    return table_entry
-
-
-async def deleteFlowRule(sw, table_entry):
-    """
-    Deletes a table entry with retry logic.
-    """
-    log.info(f"Deleting flow_cache entry on {sw.name}: "
-             f"{flowCacheEntryToDebugStr(table_entry)}")
-    
-    for i in range(RETRY_TIMES):
-        try:
-            sw.DeleteTableEntry(table_entry)
-            log.debug(f"Successfully deleted entry from {sw.name}")
-            return True
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNKNOWN or e.code() == grpc.StatusCode.NOT_FOUND:
-                log.warning(f"gRPC error deleting from {sw.name} (Attempt {i + 1}/{RETRY_TIMES}): {e.code().name}. Retrying...")
-                await asyncio.sleep(RETRY_SLEEP_SEC)
-            else:
-                log.warning(f"Non-retriable gRPC error deleting from {sw.name} (may be ok):")
-                printGrpcError(e)
-                return False
-        except Exception as e:
-            log.error(f"Unexpected error deleting from {sw.name}: {e}")
-            traceback.print_exc()
-            return False
-    log.error(f"Failed to delete entry from {sw.name} after {RETRY_TIMES} attempts.")
     return False
 
 
@@ -448,224 +420,139 @@ def sendPacketOut(sw, payload, metadatas):
     sw.PacketOut(payload, metadatas)
 
 
-def readTableRules(p4info_helper, sw):
-    """
-    Reads and logs all table entries from the switch.
-    """
-    log.info(f'\n----- Reading tables rules for {sw.name} -----')
-    for response in sw.ReadTableEntries():
-        for entity in response.entities:
-            entry = entity.table_entry
-            log.info(entry)
-            log.info('-----')
-
-
-def printCounter(p4info_helper, sw, counter_name, index):
-    """
-    Reads and logs a specific counter entry.
-    """
-    try:
-        for response in sw.ReadCounters(p4info_helper.get_counters_id(counter_name), index):
-            for entity in response.entities:
-                counter = entity.counter_entry
-                log.info(f"{sw.name} {counter_name} {index}: "
-                         f"{counter.data.packet_count} packets "
-                         f"({counter.data.byte_count} bytes)")
-    except grpc.RpcError as e:
-        log.warning(f"[gRPC Error in printCounter for {sw.name}]")
-        printGrpcError(e)
-    except Exception as e:
-        log.error(f"[Unexpected Error in printCounter for {sw.name}]: {e}")
-        traceback.print_exc()
-
-
-def is_device_authenticated(src_mac, dst_ip, ingress_port):
-    """
-    Checks if a device is allowed based on source MAC, destination IP, and ingress port.
-    Uses global_data['allowed_devices'] which maps allowed MACs to their allowed destinations and ports.
-    """
-    allowed = global_data.get('allowed_devices', {})
-
-    if src_mac not in allowed:
-        log.warning(f"[Auth] Unknown device MAC {src_mac}, rejecting.")
-        return False
-    
-    device_info = allowed[src_mac]
-    expected_ip = device_info['ip']
-    expected_port = device_info.get('port', None)
-    
-    # Check destination IP
-    if expected_ip != dst_ip:
-        log.warning(f"[Auth] Device {src_mac} unauthorized for destination IP {dst_ip} "
-                    f"(expected {expected_ip})")
-        return False
-    
-    # Check ingress port if specified
-    if expected_port is not None and expected_port != ingress_port:
-        log.warning(f"[Auth] Device {src_mac} on wrong port {ingress_port} "
-                    f"(expected {expected_port})")
-        return False
-    
-    log.info(f"[Auth] Device {src_mac} authenticated for service {device_info['service']} "
-             f"on IP {dst_ip}, port {ingress_port}")
-    return True
-
-
 async def processPacket(message):
     """
     Processes a PacketIn message.
-    Authenticates (src_mac, dst_ip, ingress_port) tuples and installs bidirectional flow rules.
-    Now uses source MAC, destination IP, and ingress port for flow identification.
     """
     payload = message["packet-in"].payload
     packet = message["packet-in"]
     ingress_sw_name = message["sw"].name
-    log.info(f"Received PacketIn message of length {len(payload)} bytes from switch {ingress_sw_name}")
+    ingress_sw = message["sw"]
+    
+    log.info(f"Received PacketIn message of length {len(payload)} "
+             f"bytes from switch {ingress_sw_name}")
 
     if len(payload) == 0:
-        return None
+        return
 
     pkt = Ether(payload)
     if not pkt.haslayer(IP):
         log.warning("PacketIn is not IP, ignoring.")
-        return None
+        return
 
-    ip_proto = pkt[IP].proto
+    ip_sa_str = pkt[IP].src
     ip_da_str = pkt[IP].dst
-    src_mac_str = pkt[Ether].src
-    dst_mac_str = pkt[Ether].dst
+    dst_ip_addr = ipv4ToInt(ip_da_str) # Get Dst IP as int for table rule
+    src_mac = pkt[Ether].src
     
-    src_mac_int = macToInt(src_mac_str)
-    dst_ip_addr = ipv4ToInt(ip_da_str)
-    counter_index = int(pkt[IP].dst.split('.')[3])
-
     pktinfo = decodePacketInMetadata(global_data['cpm_packetin_id2data'], packet)
-    
-    # Extract ingress port from packet metadata
-    # Extract ingress port from packet metadata
-    ingress_port = pktinfo['metadata'].get('input_port', None)
-    if ingress_port is None:
-        log.error("Could not extract input_port from PacketIn metadata. Dropping packet.")
-        return counter_index
+    punt_reason_int = pktinfo['metadata']['punt_reason']
 
-    flow_key = (src_mac_int, dst_ip_addr, ingress_port, ip_proto)
+    if punt_reason_int == global_data['punt_reason_name2int']['AUTH_REQUIRED']:
+        log.info(f"Processing AUTH_REQUIRED PacketIn from {ingress_sw_name} "
+                 f"for device: {src_mac} (flow: {ip_sa_str} -> {ip_da_str})")
 
-    # Ignore PacketIns that aren't flow-miss
-    if pktinfo['metadata']['punt_reason'] != global_data['punt_reason_name2int']['FLOW_UNKNOWN']:
-        reason = global_data['punt_reason_int2name'].get(pktinfo['metadata']['punt_reason'], 'UNKNOWN')
-        log.info(f"Ignoring PacketIn from {ingress_sw_name} with reason {reason} for flow: "
-                 f"{src_mac_str} -> {ip_da_str} (port {ingress_port})")
-        return counter_index
+        # 1. Device Authentication & 2. Service Profile Check
+        if (src_mac in global_data['allowed_devices'] and
+            ip_da_str in global_data['allowed_devices'][src_mac]):
 
-    log.info(f"Processing FLOW_UNKNOWN PacketIn from {ingress_sw_name} for flow: "
-             f"{src_mac_str} -> {ip_da_str} (ingress_port {ingress_port})")
+            log.info(f"Device {src_mac} authenticated for destination {ip_da_str}.")
 
-    # --- AUTHENTICATION CHECK ---
-    if not is_device_authenticated(src_mac_str, ip_da_str, ingress_port):
-        log.warning(f"[SECURITY] Unauthorized device {src_mac_str} attempting to access {ip_da_str} "
-                    f"on port {ingress_port}. Dropping.")
-        return counter_index
-    # --- END AUTHENTICATION CHECK ---
+            # 3. Tag Generation (Corrected: per-flow)
+            flow_key = (src_mac, ip_da_str)
+            if flow_key in global_data['flow_tags']:
+                tag = global_data['flow_tags'][flow_key]
+                log.debug(f"Flow {flow_key} already has tag: {tag}")
+            else:
+                tag = global_data['next_tag_id']
+                global_data['next_tag_id'] += 1
+                global_data['flow_tags'][flow_key] = tag
+                log.info(f"Generated new tag {tag} for flow {flow_key}")
 
-    # --- PATH COMPUTATION ---
-    # Find destination MAC from host_info
-    dst_mac_from_ip = None
-    for mac, info in global_data['host_info'].items():
-        if info['ip'] == ip_da_str:
-            dst_mac_from_ip = mac
-            break
-    
-    if dst_mac_from_ip is None:
-        log.error(f"Could not find MAC for destination IP {ip_da_str}. Packet will be dropped.")
-        return counter_index
+            # 4. Path Calculation and Rule Installation
+            path = get_path(ip_sa_str, ip_da_str)
+            if not path:
+                log.error(f"Could not find path for {ip_sa_str} -> {ip_da_str}.")
+                return
 
-    path = get_path(src_mac_str, dst_mac_from_ip)
-    if not path:
-        log.error(f"Could not find path for {src_mac_str} -> {dst_mac_from_ip}. Packet will be dropped.")
-        return counter_index
+            final_dest_mac = global_data['host_info'][ip_da_str]['mac']
+            install_tasks = []
 
-    final_dest_mac = dst_mac_from_ip
-    packet_out_port = None
+            # Find the *true* ingress switch (the one connected to the src_ip)
+            true_ingress_sw_name = global_data['host_info'][ip_sa_str]['switch']
 
-    # --- FORWARD FLOW INSTALLATION (src -> dst) ---
-    forward_tasks = []
-    current_ingress_port = ingress_port
-    
-    for i in range(len(path)):
-        current_switch_name = path[i]
-        current_switch_obj = global_data['switches'][current_switch_name]
+            for i in range(len(path)):
+                current_switch_name = path[i]
+                current_switch_obj = global_data['switches'][current_switch_name]
 
-        if i == len(path) - 1:
-            dest_host_name = global_data['host_info'][dst_mac_from_ip]['name']
-            output_port = global_data['link_info'][current_switch_name][dest_host_name]
-            dest_mac = final_dest_mac
+                is_final_hop = (i == len(path) - 1)
+
+                if is_final_hop:
+                    # Last hop switch -> destination host
+                    dest_node_name = global_data['host_info'][ip_da_str]['name']
+                    output_port = global_data['link_info'][current_switch_name][dest_node_name]
+                    next_hop_mac = final_dest_mac
+                else:
+                    # Ingress or transit switch -> next switch
+                    dest_node_name = path[i+1] # This is the next switch name
+                    output_port = global_data['link_info'][current_switch_name][dest_node_name]
+                    # Get the MAC of the input port on the *next* switch
+                    next_switch_input_port = global_data['link_info'][dest_node_name][current_switch_name]
+                    next_hop_mac = get_port_mac(dest_node_name, next_switch_input_port)
+
+                # Only install the device_auth_rule on the *true* ingress switch
+                if current_switch_name == true_ingress_sw_name:
+                    task = add_flow_auth_rule(current_switch_obj,
+                                                src_mac, dst_ip_addr, tag, output_port,
+                                                next_hop_mac)
+                    install_tasks.append(task)
+                
+                # ALL switches on the path need a Tag->Validate rule.
+                task = add_tag_validation_rule(current_switch_obj,
+                                                 tag, output_port,
+                                                 next_hop_mac,
+                                                 is_final_hop=is_final_hop)
+                install_tasks.append(task)
+                
+            await asyncio.gather(*install_tasks)
+            
+            # 5. Send PacketOut to resume the original packet's journey
+            # Only send PacketOut from the *true* ingress switch
+            if ingress_sw_name == true_ingress_sw_name:
+                log.info(f"Sending PacketOut to {ingress_sw_name} to re-process and forward packet")
+                metadatas = packetOutMetadataList(
+                    global_data['controller_opcode_name2int']['SEND_TO_PORT_IN_OPERAND0'],
+                    0, 0) # Port 0 is unused, just re-process
+                sendPacketOut(ingress_sw, payload, metadatas)
+            else:
+                # This was a packet punted from a transit switch.
+                # The rules are now installed, so we can drop this packet.
+                # The *next* packet from the host will be tagged correctly.
+                log.warning(f"Dropping stale punted packet from transit switch {ingress_sw_name}")
+
         else:
-            next_switch_name = path[i + 1]
-            output_port = global_data['link_info'][current_switch_name][next_switch_name]
-            dest_mac = final_dest_mac
+            # *** NEW LOGIC ***
+            # Authentication Failed!
+            log.warning(f"Device {src_mac} authentication FAILED for dst {ip_da_str}. "
+                        f"Installing proactive drop rule.")
+            
+            # Find the *true* ingress switch to install the drop rule
+            true_ingress_sw_name = global_data['host_info'][ip_sa_str]['switch']
+            true_ingress_sw_obj = global_data['switches'][true_ingress_sw_name]
+            
+            # Install the drop rule on the true ingress switch
+            await add_proactive_drop_rule(true_ingress_sw_obj, src_mac, dst_ip_addr)
+            
+            # We don't need to do anything else. The packet that was
+            # punted is already dropped by the P4 program.
+            # Subsequent packets will be dropped by the new data plane rule.
 
-        if i == 0:
-            packet_out_port = output_port
-
-        forward_tasks.append(addFlowRule(
-            current_switch_obj, src_mac_int, dst_ip_addr, current_ingress_port, ip_proto,
-            output_port, new_dscp=5, decrement_ttl_bool=True, dst_eth_addr=dest_mac))
-        
-        # For next switch in path, the ingress port is the port connected from current switch
-        if i < len(path) - 1:
-            next_switch_name = path[i + 1]
-            current_ingress_port = global_data['link_info'][next_switch_name][current_switch_name]
-
-    # --- REVERSE FLOW INSTALLATION (dst -> src) ---
-    reverse_tasks = []
-    reverse_src_mac_int = macToInt(dst_mac_from_ip)
-    # Get source IP for reverse flow
-    src_ip_str = pkt[IP].src
-    reverse_dst_ip_addr = ipv4ToInt(src_ip_str)
-    reverse_dst_mac = src_mac_str
-
-    reverse_path = list(reversed(path))
-    
-    # For reverse path, ingress port at destination host's switch
-    dest_host_name = global_data['host_info'][dst_mac_from_ip]['name']
-    reverse_ingress_port = global_data['link_info'][reverse_path[0]][dest_host_name]
-    
-    for i in range(len(reverse_path)):
-        current_switch_name = reverse_path[i]
-        current_switch_obj = global_data['switches'][current_switch_name]
-
-        if i == len(reverse_path) - 1:
-            dest_host_name = global_data['host_info'][src_mac_str]['name']
-            output_port = global_data['link_info'][current_switch_name][dest_host_name]
-            dest_mac = reverse_dst_mac
-        else:
-            next_switch_name = reverse_path[i + 1]
-            output_port = global_data['link_info'][current_switch_name][next_switch_name]
-            dest_mac = reverse_dst_mac
-
-        reverse_tasks.append(addFlowRule(
-            current_switch_obj, reverse_src_mac_int, reverse_dst_ip_addr, reverse_ingress_port, 
-            ip_proto, output_port, new_dscp=5, decrement_ttl_bool=True, dst_eth_addr=dest_mac))
-        
-        # For next switch in reverse path, the ingress port is the port connected from current switch
-        if i < len(reverse_path) - 1:
-            next_switch_name = reverse_path[i + 1]
-            reverse_ingress_port = global_data['link_info'][next_switch_name][current_switch_name]
-
-    # Install both directions concurrently
-    await asyncio.gather(*(forward_tasks + reverse_tasks))
-
-    # Send the original packet out from ingress switch
-    if packet_out_port is not None:
-        log.info(f"Sending PacketOut to {ingress_sw_name} (port {packet_out_port}) to continue flow")
-        metadatas = packetOutMetadataList(
-            global_data['controller_opcode_name2int']['SEND_TO_PORT_IN_OPERAND0'],
-            0, packet_out_port)
-        sendPacketOut(message["sw"], payload, metadatas)
     else:
-        log.error("Could not determine PacketOut port. Packet not sent.")
+        reason = global_data['punt_reason_int2name'].get(punt_reason_int, 'UNKNOWN')
+        log.info(f"Ignoring PacketIn from {ingress_sw_name} with "
+                 f"reason {reason} for flow: {ip_sa_str} -> {ip_da_str}")
 
-    return counter_index
+    return
 
 
 async def processNotif(notif_queue):
@@ -675,25 +562,11 @@ async def processNotif(notif_queue):
             notif = await notif_queue.get()
             
             if notif["type"] == "packet-in":
-                counter_index = None  # Default
                 try:
-                    counter_index = await processPacket(notif)
+                    await processPacket(notif)
                 except Exception as e:
                     log.error(f"Error processing packet: {e}")
                     traceback.print_exc()
-
-                if counter_index is not None:
-                    read_index = counter_index % 4
-                    log.info(f"--- Reading counters for index {read_index} on "
-                             f"{notif['sw'].name} ---")
-                    printCounter(global_data['p4info_helper'], notif["sw"],
-                                 'MyIngress.ingressPktOutCounter', read_index)
-                    printCounter(global_data['p4info_helper'], notif["sw"],
-                                 'MyEgress.egressPktInCounter', read_index)
-            
-            # ### DISABLED IDLE TIMEOUT ###
-            # elif notif["type"] == "idle-notif":
-            #     log.info("Idle timeout notification received, but functionality is disabled.")
             
             notif_queue.task_done()
         except Exception as e:
@@ -721,27 +594,6 @@ async def packetInHandler(notif_queue, sw):
             traceback.print_exc()
             await asyncio.sleep(1)
 
-# ### DISABLED IDLE TIMEOUT ###
-# async def idleTimeHandler(notif_queue, sw):
-#     """Listens for IdleTimeout notifications from a switch."""
-#     while True:
-#         try:
-#             idle_notif = await asyncio.to_thread(sw.IdleTimeoutNotification)
-#             message = {"type": "idle-notif", "sw": sw, "idle": idle_notif}
-#             await notif_queue.put(message)
-#         except grpc.RpcError as e:
-#             if e.code() != grpc.StatusCode.CANCELLED:
-#                 log.warning(f"[gRPC Error in idleTimeHandler for {sw.name}]")
-#                 printGrpcError(e)
-#             else:
-#                 log.info(f"IdleTimeout stream cancelled for {sw.name}.")
-#                 break
-#             await asyncio.sleep(1)
-#         except Exception as e:
-#             log.error(f"[Unexpected Error in idleTimeHandler for {sw.name}]: {e}")
-#             traceback.print_exc()
-#             await asyncio.sleep(1)
-
 
 def printGrpcError(e):
     log.error(f"gRPC Error: {e.details()} (code: {e.code().name})")
@@ -767,36 +619,13 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
     try:
         # --- DYNAMIC SWITCH CONNECTION ---
         global_data['switches'] = {}
-        
-        # --- MODIFIED FOR PORT-BASED AUTH ---
-        # This is the static auth list
-        global_data['allowed_devices'] = {
-            "08:00:00:00:01:11": {"ip": "10.0.2.2", "service": "sensing"},
-            "08:00:00:00:02:22": {"ip": "10.0.3.3", "service": "actuating"},
-            "08:00:00:00:03:33": {"ip": "10.0.1.1", "service": "analytics"}
-        }
-
-        # Augment allowed_devices with port info from topology
-        # This fulfills the prompt to check ingress_port
-        log.info("Augmenting allowed devices with port info from topology...")
-        host_info = global_data.get('host_info', {})
-        for mac, auth_info in global_data['allowed_devices'].items():
-            if mac in host_info:
-                auth_info['port'] = host_info[mac]['port']
-                log.info(f"  -> Set expected port {auth_info['port']} for {mac}")
-            else:
-                log.warning(f"  -> MAC {mac} from allowed_devices not in topology host_info!")
-        # --- END MODIFICATION ---
-
-        switch_names = sorted(global_data['topology']['switches'].keys())
         all_switches = []
-        device_id_counter = 0
         grpc_port_base = 50051  # Standard base port
 
-        for sw_name in switch_names:
-            device_id = device_id_counter
+        # Use the topology.json to find switch names
+        switch_names = sorted(global_data['topology']['switches'].keys())
+        for device_id, sw_name in enumerate(switch_names):
             grpc_port = grpc_port_base + device_id
-            
             sw = p4runtime_lib.bmv2.Bmv2SwitchConnection(
                 name=sw_name,
                 address=f'127.0.0.1:{grpc_port}',
@@ -805,7 +634,7 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
             )
             global_data['switches'][sw_name] = sw
             all_switches.append(sw)
-            device_id_counter += 1
+            log.info(f"Connecting to switch {sw_name} on port {grpc_port} (device_id {device_id})")
         
         for sw in all_switches:
             sw.MasterArbitrationUpdate()
@@ -831,18 +660,34 @@ async def main(p4info_file_path, bmv2_file_path, topo_file_path):
             serializableEnumDict(p4info_helper.p4info, 'ControllerOpcode_t')
 
         # Configure clone session for Packet-In
-        replicas = [{"egress_port": global_data['CPU_PORT'], "instance": 1}] # <-- Fixed key from CPU_port
+        replicas = [{"egress_port": global_data['CPU_PORT'], "instance": 1}]
         for sw in all_switches:
             writeCloneSession(sw, global_data['CPU_PORT_CLONE_SESSION_ID'], replicas)
         log.info("Configured clone sessions for Packet-In on all switches")
+        
+        # Add Egress SMAC rules (optional, for correct L2 forwarding)
+        for sw_name, links in global_data['link_info'].items():
+            if sw_name not in global_data['switches']:
+                log.warning(f"Switch {sw_name} from link_info not in connected switches. Skipping SMAC rule.")
+                continue
+            sw = global_data['switches'][sw_name]
+            for node_name, port_num in links.items():
+                smac = get_port_mac(sw_name, port_num)
+                smac_rule = p4info_helper.buildTableEntry(
+                    table_name="MyEgress.egress_smac",
+                    match_fields={"standard_metadata.egress_port": port_num},
+                    action_name="MyEgress.set_egress_smac",
+                    action_params={"smac": smac}
+                )
+                await write_table_entry(sw, smac_rule)
+        log.info("Installed egress source MAC rules on all switches")
+
 
         # Start listening for notifications
         notif_queue = asyncio.Queue()
         tasks = [asyncio.create_task(processNotif(notif_queue))]
         for sw in all_switches:
             tasks.append(asyncio.create_task(packetInHandler(notif_queue, sw)))
-            # ### DISABLED IDLE TIMEOUT ###
-            # tasks.append(asyncio.create_task(idleTimeHandler(notif_queue, sw)))
         
         await asyncio.gather(*tasks)
 
@@ -865,6 +710,7 @@ if __name__ == '__main__':
     parser.add_argument('--bmv2-json', help='BMv2 JSON file from p4c',
                         type=str, action="store", required=False,
                         default='./build/flowcache.json')
+    # Use the new topology file as the default
     parser.add_argument('--topo', help='Topology JSON file',
                         type=str, action="store", required=False,
                         default='topology.json')
@@ -881,10 +727,17 @@ if __name__ == '__main__':
         parser.print_help()
         sys.exit(1)
 
-    for f in [args.p4info, args.bmv2_json]:
-        if not os.path.exists(f):
-            log.error(f"\nFile not found: {f}\nHave you run 'make'?")
-            parser.print_help()
-            sys.exit(1)
+    # Use the P4 program name from the makefile
+    p4info_file = args.p4info
+    bmv2_file = args.bmv2_json
 
-    asyncio.run(main(args.p4info, args.bmv2_json, topo_file))
+    if not os.path.exists(p4info_file):
+        log.error(f"\nP4Info file not found: {p4info_file}\n"
+                  f"Have you run 'make'?")
+        parser.exit(1)
+    if not os.path.exists(bmv2_file):
+        log.error(f"\nBMv2 JSON file not found: {bmv2_file}\n"
+                  f"Have you run 'make'?")
+        parser.exit(1)
+
+    asyncio.run(main(p4info_file, bmv2_file, topo_file))
